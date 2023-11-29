@@ -1,0 +1,5 @@
+imagenet/
+data/
+__pycache__/
+*.pth
+*.pyc
