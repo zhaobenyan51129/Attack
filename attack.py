@@ -100,9 +100,10 @@ class GradCAMWrapper:
 
  
 class ImageNetPredictor:
-    def __init__(self, model, data_root='./imagenet', image_size=224):
+    def __init__(self, model, data_root='./imagenet', num_images = 36, image_size=224):
         self.model = model
         self.data_root = data_root
+        self.num_images = num_images
         self.image_size = image_size
         self.transform = torchvision.transforms.Compose([
             torchvision.transforms.Resize(256),
@@ -116,9 +117,9 @@ class ImageNetPredictor:
         return max_value_and_idx[1], max_value_and_idx[0] # 获得预测的label和对应概率
     
     # 保存预测正确的图片和标签
-    def save_correct_preds(self, num_runs = 36, batch_file='./data/images_labels.pth'):
-        images = torch.zeros(num_runs, 3, self.image_size, self.image_size) # [100, 3, 224, 224]
-        labels = torch.zeros(num_runs).long() # [100,][0,0,...,0]
+    def save_correct_preds(self, batch_file):
+        images = torch.zeros(self.num_images, 3, self.image_size, self.image_size) # [100, 3, 224, 224]
+        labels = torch.zeros(self.num_images).long() # [100,][0,0,...,0]
         preds = labels + 1 # [100, ][1,1,...,1]
         while preds.ne(labels).sum() > 0: # 没全预测对则继续循环 ne:不相等返回1
             idx = torch.arange(0, images.size(0)).long()[preds.ne(labels)] # 过滤没预测对的， .long-> torch.int64
@@ -127,15 +128,15 @@ class ImageNetPredictor:
             preds[idx], _ = self.get_preds(images[idx])
         torch.save({'images': images, 'labels': labels}, batch_file)
 
-# 载入图片的函数，图片放在一个文件夹下
-def load_images(model, image_folder):
+# 载入图片的函数，图片放在一个文件夹下, num_images为载入图片数量
+def load_images(model, image_folder, num_images = 36):
 
     if image_folder == 'imagenet':
         #从本地加载图片和标签, 硬编码，后面考虑改掉
-        batch_file = './data/images_labels.pth'
+        batch_file = f'./data/images_labels_{num_images}.pth'
         if not os.path.exists(batch_file):
-            predictor = ImageNetPredictor(model)
-            predictor.save_correct_preds()
+            predictor = ImageNetPredictor(model, num_images=num_images)
+            predictor.save_correct_preds(batch_file = batch_file)
         images_labels = torch.load(batch_file)
         input_tensor = images_labels['images']
         labels = images_labels['labels']
@@ -192,9 +193,12 @@ def show_images(imgs, titles = None, output_path = None, save_name = None, scale
     axes = axes.flatten()
     for i, (ax, image) in enumerate(zip(axes, imgs)):
         if torch.is_tensor(image):# tensor
-            ax.imshow(image.numpy().transpose(1, 2, 0))
+            image = image.numpy().transpose(1, 2, 0)
+        if image.dtype == np.float32 or image.dtype == np.float64:
+            image = np.clip(image, 0, 1)
         else:
-            ax.imshow(image)
+            image = np.clip(image, 0, 255)
+        ax.imshow(image)
         ax.axis("off")  
         if titles:
             ax.set_title(titles[i])
@@ -211,7 +215,7 @@ class Attack:
     def __init__(self, gradcam, input_tensor, num, ratio, mode = 'top'):
         '''
         gradcam: 一个GradCAMWrapper对象，用于计算每一步的梯度和grad-cam图
-        input_tensor: 用于模型输入的tensor, 没有normalize,[batch,3,224,224]tensor
+        input_tensor: 用于模型输入的tensor, 没有normalize, [batch,3,224,224]tensor
         num: 攻击的像素个数
         ratio: 攻击的强度
         mode: 攻击的模式，top或者random
@@ -245,19 +249,20 @@ class Attack:
                 top_indices = np.argpartition(flattened_image, -self.num, axis=None)[-self.num:]
                 coordinates_tmp = np.column_stack(np.unravel_index(top_indices, self.feature_array.shape[1:]))
                 coordinates[i] = coordinates_tmp
-                top_array[i].flat[top_indices] = 1 
-                top_array = np.transpose(top_array, (0,3,1,2)) 
+                top_array[i].flat[top_indices] = 1  
             else:
                 print('不支持的维度')
+        if dim == 4:
+            top_array = np.transpose(top_array, (0,3,1,2))
         return top_array, coordinates
     
-    def add_grey_to_channel(self):
+    def add_grey_to_channel(self, top_array):
         """
         将灰度图像的像素值加到输入张量的随机指定通道上。
 
         参数:
+        - top_array: 形状为 (batch_size, height, width) ,每个位置为0或1
         - input_tensor: 形状为 (batch_size, num_channels, height, width) 的输入张量。
-        - feature_array: 形状为 (batch_size, height, width) 的灰度图像。
 
         返回:
         形状为 (batch_size, num_channels, height, width) 的新张量。
@@ -265,19 +270,23 @@ class Attack:
         num_channels = self.input_tensor.shape[1]
         batch_size = self.input_tensor.shape[0]
         channel_idx = torch.randint(0, num_channels, (batch_size,))
-        attacked_tensor = input_tensor.clone()
+        attacked_tensor = self.input_tensor.clone()
         for i in range(input_tensor.shape[0]):
-            attacked_tensor[i, channel_idx[i], :, :] += self.feature_array[i, :, :] * self.ratio
+            noise = np.random.normal(loc=0.0, scale= self.ratio, size = top_array[i, :, :].shape)
+            attacked_tensor[i, channel_idx[i], :, :] = self.input_tensor[i, channel_idx[i], :, :] + top_array[i, :, :] * noise
+        assert attacked_tensor.shape == input_tensor.shape
         return attacked_tensor
     
     def get_attacked_input_tensor(self):
+        '''攻击后的图片，可直接作为模型输入'''
         dim = np.ndim(self.feature_array)
+        noise = np.random.normal(loc=0.0, scale= self.ratio, size = self.input_tensor.shape)
         if self.mode == 'top':
-            top_array, _ = self.compute_top_indics(self.feature_array, self.num)
+            top_array, _ = self.compute_top_indics()
             if dim == 3:
-                attacked_tensor = self.add_grey_to_channel().float()
+                attacked_tensor = self.add_grey_to_channel(top_array).float()
             elif dim == 4:
-                attacked_tensor = (self.input_tensor + top_array * self.ratio).float()
+                attacked_tensor = (self.input_tensor + top_array * noise).float()
             else:
                 print('不支持的维度')
 
@@ -287,12 +296,21 @@ class Attack:
             one_indices = np.random.choice(np.prod(shape), size=self.num, replace=False)
             indices = np.unravel_index(one_indices, shape)
             mask[indices] = 1
-            attacked_tensor = (self.input_tensor + mask * self.ratio).float()
+            attacked_tensor = (self.input_tensor + mask * noise).float()
         assert attacked_tensor.shape == self.input_tensor.shape  
         return attacked_tensor
     
-    def predict_and_attack(self, mask='cam'):
+    def predict_and_attack(self, mask = 'cam', output_path = None):
+
+        if os.path.exists(output_path) and os.path.isdir(output_path):
+            print(f'删除文件夹：{output_path}')
+            shutil.rmtree(output_path)
         original_classes, grayscale_cam, grad_of_input = self.gradcam(self.input_tensor)
+
+        loop_count = 0
+        show_images(self.input_tensor, titles = original_classes, output_path = output_path, save_name = f'{str(loop_count)}.png')
+
+        print(f"原始的预测类别 = {original_classes}")
         if mask == 'cam':
             self.feature_array = grayscale_cam
         elif mask == 'grad':
@@ -301,23 +319,24 @@ class Attack:
             raise ValueError("Invalid value for 'mask'. Use 'cam' or 'grad'.")
 
         self.attacked_tensor = self.get_attacked_input_tensor()
-        loop_count = 0 
+         
         while True:
-            predicted_classes, grayscale_cam, grad_of_input = self.gradcam(self.attacked_tensor)
-            if not any(pred_class == orig_class for pred_class, orig_class in zip(predicted_classes, original_classes)):
-                break  # 如果全部不相同，跳出循环
-            if mask == 'cam':
-                self.feature_array = grayscale_cam
-            elif mask == 'grad':
-                self.feature_array = grad_of_input
-            self.input_tensor = self.attacked_tensor
-            self.attacked_tensor = self.get_attacked_input_tensor()
             loop_count += 1
-            output_path = f'./data/attacked_{self.model_name}/{mask}_{self.ratio}'
-            if os.path.exists(output_path) and os.path.isdir(output_path):
-                shutil.rmtree(output_path)
+            predicted_classes, grayscale_cam, grad_of_input = self.gradcam(self.attacked_tensor)
             show_images(self.attacked_tensor, titles = predicted_classes, output_path = output_path, save_name = f'{str(loop_count)}.png')
-        return loop_count, original_classes, predicted_classes, self.attacked_tensor
+            num_differences = sum(pred_class != orig_class for pred_class, orig_class in zip(predicted_classes, original_classes))
+            if num_differences >= len(predicted_classes) / 2:
+                print(f"攻击之后的预测类别：{predicted_classes}")
+                return loop_count, original_classes, predicted_classes, self.attacked_tensor
+            else:
+                if mask == 'cam':
+                    self.feature_array = grayscale_cam
+                elif mask == 'grad':
+                    self.feature_array = grad_of_input
+                self.input_tensor = self.attacked_tensor
+                self.attacked_tensor = self.get_attacked_input_tensor()
+                print(f'loop_count = {loop_count}')
+
 
 
 if __name__ == '__main__':
@@ -335,9 +354,13 @@ if __name__ == '__main__':
     #     # print(predicted_classes)
     #     gradcam.show_cam(img, grayscale_cam, predicted_classes)
     #     gradcam.show_grad(grad_of_input, predicted_classes)
-    model_name = 'ViT'
+    model_name = 'ViT' # 'VGG16' ,'ResNet'
+    mask='cam' # 'grad', 'cam'
+    ratio=0.5
+    mode='top' # 'top', 'random'
     model, use_cuda, reshape_transform = load_model(model_name)
     input_tensor, img, labels = load_images(model, image_folder)
     gradcam = GradCAMWrapper(model_name)
-    loop_count, original_classes, predicted_classes, attacked_tensor = Attack(gradcam, input_tensor, num=200, ratio=0.5, mode='top').predict_and_attack(mask='grad')
+    output_path = f'./data/{image_folder}_attacked_{mask}_{mode}/{ratio}'
+    loop_count, original_classes, predicted_classes, attacked_tensor = Attack(gradcam, input_tensor, num=200, ratio = ratio, mode = mode).predict_and_attack(mask = mask, output_path = output_path)
 
