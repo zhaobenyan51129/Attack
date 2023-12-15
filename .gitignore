@@ -1,5 +1,6 @@
 imagenet/
-data/
+data/*
+!data/imagenet_class_index.json
 __pycache__/
 *.pth
 *.pyc
