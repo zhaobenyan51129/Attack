@@ -292,3 +292,28 @@ def decode_predictions(preds, top=1):
    
     return predicted_classes, predicted_id
 
+def images_to_video(image_path, output_path, num_differences_list):
+    output_dir = os.path.dirname(output_path)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    img_array = []
+    imgList = os.listdir(image_path)
+    imgList.sort(key=lambda x: float(x.split('.')[0]))  
+    for count in range(0, len(imgList)): 
+        filename = os.path.join(imgList[count])
+        img = cv2.imread(image_path + filename)
+        if img is None:
+            print(filename + " is error!")
+            continue
+        
+        cv2.putText(img, f"Frame: {count + 1}/{len(imgList)}, Number_changed: {num_differences_list[count]}/36", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        img_array.append(img)
+
+    height, width, _ = img_array[0].shape# img.shape
+    size = (width, height)
+    fps = 10  # 设置每帧图像切换的速度
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, size)
+ 
+    for i in range(len(img_array)):
+        out.write(img_array[i])
+    out.release()

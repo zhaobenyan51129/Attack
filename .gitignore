@@ -3,3 +3,9 @@ data/
 __pycache__/
 *.pth
 *.pyc
+*.log
+*.txt
+*.zip
+*.tar
+*.gz
+*.rar
